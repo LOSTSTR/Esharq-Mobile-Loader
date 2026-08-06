@@ -14,9 +14,12 @@ import java.io.File
  * Waits for script updates and loads the Revenge bundle. Depends on [io.github.revenge.xposed.tweaks.base.scriptLoader].
  *
  * 1. Awaits the bundle download from [revengeUpdater].
- * 2. Runs every file under `files/pyoncord/preloads/`.
- * 3. Loads `cache/revenge/bundle.js` (downloaded copy) if present.
- * 4. Falls back to the in-APK `assets://revenge.bundle` asset shipped with this module.
+ * 2. Runs every file under `files/pyoncord/preloads/` — the Esharq grant lands here, first by name.
+ * 3. Loads `cache/revenge/bundle.js` if the server served one.
+ *
+ * There is deliberately no step 4. Upstream falls back to a copy of the mod shipped inside the
+ * APK, which would run for anyone who installed the app, member or not — the exact thing this
+ * fork exists to prevent. When there is no authorised bundle, Discord simply runs unmodified.
  */
 val revengeScriptLoader by tweak {
     val dataDir = appInfo.dataDir
@@ -49,11 +52,10 @@ private fun runRevengeScripts(scope: InjectorScope, preloadsDir: File, mainScrip
         }
 
         if (mainScript.exists()) {
-            log.i("Loading downloaded bundle: ${mainScript.absolutePath}")
+            log.i("Loading authorised bundle: ${mainScript.absolutePath}")
             scope.runFile(mainScript.absolutePath)
         } else {
-            log.i("Downloaded bundle missing; falling back to ${RevengeConstants.FALLBACK_BUNDLE_ASSET}")
-            scope.runAsset(RevengeConstants.FALLBACK_BUNDLE_ASSET)
+            log.i("No authorised bundle; leaving Discord unmodified")
         }
     } catch (e: Throwable) {
         log.e("Unable to run Revenge scripts", e)

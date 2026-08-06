@@ -46,5 +46,11 @@ internal suspend fun refreshRepo(url: String): RepoIndex {
 
             index
         }
+
+        // Plugin repositories are third-party hosts, not the Esharq gate. If one of them answers
+        // 401/403 it is refusing this fetch, not this user's access to Esharq, so it stays a
+        // failure of that repository alone.
+        is ETagFetchResult.Refused ->
+            throw IllegalStateException("Repository '$url' refused the request: ${result.refusal.reason}")
     }
 }
