@@ -13,7 +13,7 @@
                 android:value="true"/>
         <meta-data
                 android:name="xposeddescription"
-                android:value="👊 Discord, your way. Revenge is a client modification for Discord Android."/>
+                android:value="Esharq for Discord Android. Served to members of the Esharq server."/>
         <meta-data
                 android:name="xposedminversion"
                 android:value="82"/>

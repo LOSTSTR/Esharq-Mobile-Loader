@@ -8,7 +8,9 @@ android {
     compileSdk = libs.versions.compileSdk.get().toInt()
 
     defaultConfig {
-        applicationId = "io.github.revenge.xposed"
+        // The install identity. The Kotlin package stays as it is on purpose — assets/xposed_init
+        // names the entry class by its package, and renaming that buys nothing but a broken module.
+        applicationId = "org.esharq.mobile.loader"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 1601

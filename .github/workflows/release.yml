@@ -16,7 +16,10 @@ permissions:
   contents: write
 
 env:
-  JAVA_VERSION: 17
+  # The Gradle toolchain in gradle/libs.versions.toml asks for Java 25. With 17 the build does not
+  # fall back — it fails outright with "Cannot find a Java installation matching languageVersion=25",
+  # which is exactly how this was found.
+  JAVA_VERSION: 25
 
 jobs:
   build:
@@ -80,6 +83,20 @@ jobs:
           mv app/build/outputs/apk_from_bundle/debug/app-debug-universal.apk dist/app-debug.apk
           mv app/build/outputs/apk_from_bundle/release/app-release-universal.apk dist/app-release.apk
           ls -l dist
+
+      # The one thing that must never regress: upstream ships a copy of the mod inside this APK and
+      # runs it when the download fails, which would run for anyone at all. If it ever comes back,
+      # the release stops here rather than shipping a way around the gate.
+      - name: Verify no bundle is shipped inside the APK
+        run: |
+          for apk in dist/app-debug.apk dist/app-release.apk; do
+            if unzip -l "$apk" | grep -qE '\.(bundle|js)$'; then
+              echo "::error::$apk ships a bundled copy of the mod"
+              unzip -l "$apk" | grep -E '\.(bundle|js)$'
+              exit 1
+            fi
+          done
+          echo "No bundle inside either APK."
 
       - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
