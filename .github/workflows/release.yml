@@ -16,9 +16,12 @@ permissions:
   contents: write
 
 env:
-  # The Gradle toolchain in gradle/libs.versions.toml asks for Java 25. With 17 the build does not
-  # fall back — it fails outright with "Cannot find a Java installation matching languageVersion=25",
-  # which is exactly how this was found.
+  # gradle/libs.versions.toml asks for toolchain 25, so that is what is installed here.
+  #
+  # 17 also works today: Gradle auto-detects the other JDKs that happen to be on the runner image
+  # and finds a 25 among them — the sibling build.yml proves it. That is luck, not a contract. The
+  # day the image drops 25 the build stops with "Cannot find a Java installation matching
+  # languageVersion=25", which is exactly what it does on a machine that has only 21.
   JAVA_VERSION: 25
 
 jobs:
