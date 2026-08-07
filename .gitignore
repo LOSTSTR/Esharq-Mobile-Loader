@@ -13,3 +13,9 @@ build
 .externalNativeBuild
 .cxx
 local.properties
+
+# Signing material never belongs in a public repository.
+*.jks
+*.keystore
+*.pw
+signing-key.jks

@@ -50,17 +50,9 @@ jobs:
           versionCode: ${{ github.event.inputs.versionCode }}
           versionName: ${{ github.event.inputs.versionName }}
 
-      - name: Commit Version Bump (if changed)
-        run: |
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-          git add app/build.gradle.kts
-          if git diff --cached --quiet; then
-            echo "No version change."
-          else
-            git commit -m "chore: bump version to ${{ github.event.inputs.versionName }} (${{ github.event.inputs.versionCode }})"
-            git push
-          fi
+      # The version is set for this build only and deliberately not committed back. A workflow
+      # that pushes to the branch it was launched from puts commits nobody wrote into the history,
+      # and the released APK already records its own version.
 
       - name: Prepare Keystore
         run: |
@@ -112,7 +104,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag=${{ github.event.inputs.versionCode }}
+          # Tagged by version name, not by version code. A bare "1000" in the tag list says nothing
+          # to anyone reading it, and the two numbers move together anyway.
+          tag="v${{ github.event.inputs.versionName }}"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             echo "Tag $tag already exists, skipping creation."
           else
@@ -120,6 +114,6 @@ jobs:
             git push origin "$tag"
           fi
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
-            --title "${{ github.event.inputs.versionName }}" \
+            --title "مُحمِّل إشراق للجوال ${{ github.event.inputs.versionName }}" \
             --generate-notes \
             dist/app-debug.apk dist/app-release.apk
