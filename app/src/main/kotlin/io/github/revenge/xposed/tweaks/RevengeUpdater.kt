@@ -52,6 +52,7 @@ object RevengeUpdater {
     private lateinit var configFile: File
     private lateinit var grantPreload: File
     private lateinit var renewedToken: File
+    private lateinit var unverifiedLaunches: File
 
     private val _downloadReady = CompletableDeferred<Unit>()
 
@@ -71,8 +72,35 @@ object RevengeUpdater {
         configFile = File(filesDir, CONFIG_PATH)
         grantPreload = File(preloadsDir, RevengeConstants.GRANT_PRELOAD_FILE)
         renewedToken = File(filesDir, RevengeConstants.RENEWED_TOKEN_FILE)
+        unverifiedLaunches = File(filesDir, RevengeConstants.UNVERIFIED_LAUNCHES_FILE)
 
         install = readEsharqInstall(appInfo, renewedToken)
+    }
+
+    private fun readUnverified(): Int =
+        runCatching { unverifiedLaunches.readText().trim().toInt() }.getOrDefault(0)
+
+    /**
+     * Counts a launch the server never answered, and gives up on the cache once too many pile up.
+     *
+     * The counter, not the grant's expiry, is what closes the offline hole: an expiry is checked
+     * against a clock the user controls, while a launch that has happened cannot be un-happened.
+     */
+    private fun countUnverifiedLaunch() {
+        val count = readUnverified() + 1
+        runCatching { AtomicFile(unverifiedLaunches).writeBytes(count.toString().toByteArray()) }
+
+        if (count >= RevengeConstants.MAX_UNVERIFIED_LAUNCHES) {
+            log.w("No answer from the server in $count launches; dropping the cached bundle")
+            bundle.delete()
+            etag.delete()
+            grantPreload.delete()
+        }
+    }
+
+    /** The server answered, so the streak is over. */
+    private fun clearUnverifiedLaunches() {
+        runCatching { unverifiedLaunches.delete() }
 
         config = runCatching {
             if (configFile.exists()) RevengeJson.decodeFromString<LoaderConfig>(configFile.readText())
@@ -128,6 +156,9 @@ object RevengeUpdater {
                 bearer = token,
             )
 
+            // The server answered at all, which is what the streak counts.
+            clearUnverifiedLaunches()
+
             if (grant is ETagFetchResult.Refused) {
                 log.w("Refused: ${grant.refusal.reason}")
                 clearAuthorisedFiles(grant.refusal)
@@ -175,9 +206,13 @@ object RevengeUpdater {
                 }
             }
         } catch (e: Throwable) {
-            // A network failure is not a refusal: the cached bundle stays, and the grant it already
-            // holds still has to be inside its own validity window for anything to run.
+            // A network failure is not a refusal, so a bad connection does not cost the user their
+            // client — but it is counted, and enough of them in a row drop the cache anyway.
+            // Otherwise leaving the server and switching the network off would keep Esharq running
+            // for good, and the grant's expiry could not stop it: that is checked against a clock
+            // the same person sets.
             log.e("Failed to download script", e)
+            countUnverifiedLaunch()
             showErrorDialog(e)
         } finally {
             _downloadReady.complete(Unit)

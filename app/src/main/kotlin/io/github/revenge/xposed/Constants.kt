@@ -42,6 +42,24 @@ object RevengeConstants {
 
     /** Where the server's renewed receipt is kept, since the one in the APK cannot be rewritten. */
     const val RENEWED_TOKEN_FILE = "esharq-token.txt"
+
+    /**
+     * How many launches may pass without the server confirming membership before the cached bundle
+     * is thrown away.
+     *
+     * A network failure deliberately keeps the cache, so that a bad connection does not cost the
+     * user their client. But "offline" is also something a user can choose: leave the server, turn
+     * the network off, and the last authorised copy would run forever — and the grant's own expiry
+     * does not stop that, because the phone's clock is set by the person being checked.
+     *
+     * A launch counter cannot be wound back the way a clock can. Five launches is generous for a
+     * real outage and short enough that going offline on purpose is not a way to keep Esharq after
+     * leaving.
+     */
+    const val MAX_UNVERIFIED_LAUNCHES = 5
+
+    /** Consecutive launches so far with no answer from the server. */
+    const val UNVERIFIED_LAUNCHES_FILE = "esharq-unverified.txt"
 }
 
 /**
