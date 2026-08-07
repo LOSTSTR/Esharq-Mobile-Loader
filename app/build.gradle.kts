@@ -13,8 +13,8 @@ android {
         applicationId = "org.esharq.mobile.loader"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 1601
-        versionName = "1.6.1"
+        versionCode = 1000
+        versionName = "1.0.0"
     }
 
     sourceSets {
