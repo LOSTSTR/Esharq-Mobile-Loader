@@ -34,6 +34,12 @@ data class LoaderConfig(
 object RevengeUpdater {
     internal val TIMEOUT = 10.seconds
     private val TIMEOUT_CACHED = 5.seconds
+
+    /** How long to wait before the one silent retry. Long enough for wifi to finish associating. */
+    private val RETRY_DELAY = 3.seconds
+
+    @Volatile
+    private var retried = false
     private const val ETAG_PATH = "etag.txt"
     private const val CONFIG_PATH = "loader.json"
 
@@ -158,6 +164,7 @@ object RevengeUpdater {
 
             // The server answered at all, which is what the streak counts.
             clearUnverifiedLaunches()
+            retried = false
 
             if (grant is ETagFetchResult.Refused) {
                 log.w("Refused: ${grant.refusal.reason}")
@@ -212,6 +219,23 @@ object RevengeUpdater {
             // for good, and the grant's expiry could not stop it: that is checked against a clock
             // the same person sets.
             log.e("Failed to download script", e)
+
+            // One quiet retry before anybody is told anything.
+            //
+            // The first attempt runs the instant Discord starts, which is the worst moment to ask
+            // for a network: wifi may not have associated yet, and a phone waking from doze
+            // throttles the first sockets it opens. A single failure at that moment is normal and
+            // says nothing about whether anything is wrong, yet it used to put a failure dialog in
+            // front of the user on a launch where everything then worked. Waiting a moment and
+            // asking once more turns most of those into nothing at all.
+            if (!retried) {
+                retried = true
+                delay(RETRY_DELAY)
+                log.i("Retrying after ${RETRY_DELAY.inWholeSeconds}s")
+                downloadScript(userInitiated = userInitiated, showDialog = showDialog)
+                return@launch
+            }
+
             countUnverifiedLaunch()
             showErrorDialog(e)
         } finally {
@@ -268,25 +292,67 @@ object RevengeUpdater {
         }
     }
 
+    /**
+     * What the user is told when the check could not be made.
+     *
+     * The old wording was wrong in three ways at once, and a user saw all three at the same time.
+     * It said "Revenge", which is not the name of the thing they installed. It said the update had
+     * failed, in English, to someone using an Arabic client. And it said it on a launch where
+     * nothing was actually broken: a failed check does not remove the copy already on the phone —
+     * clearAuthorisedFiles is called for a refusal, never for a network error — so Esharq loads and
+     * runs exactly as before, and the only thing lost is a chance to pick up a newer build.
+     *
+     * Alarming somebody about a working app teaches them to dismiss every dialog it ever shows,
+     * including the one that matters. So the message now depends on what is actually true: whether
+     * a usable copy is sitting there. The technical detail is kept, at the end, because it is the
+     * only thing anybody can send back when something really is wrong.
+     */
     private fun showErrorDialog(e: Throwable) = withAppActivity { activity ->
         activity.runOnUiThread {
-            AlertDialog.Builder(activity)
-                .setTitle("Revenge Update Failed")
-                .setMessage(
-                    """
-                    Unable to download the latest version of Revenge.
-                    This is usually caused by bad network connection.
+            val arabic = java.util.Locale.getDefault().language == "ar"
+            val running = bundle.exists() && grantPreload.exists()
 
-                    Error: ${e.message ?: e.stackTraceToString()}
-                    """.trimIndent()
-                )
-                .setNegativeButton("Dismiss") { d, _ -> d.dismiss() }
-                .setPositiveButton("Retry Update") { d, _ ->
+            val title = when {
+                running && arabic -> "إشراق يعمل — تعذّر التحقّق من التحديث"
+                running -> "Esharq is running — could not check for updates"
+                arabic -> "تعذّر تحميل إشراق"
+                else -> "Could not load Esharq"
+            }
+
+            val body = when {
+                running && arabic ->
+                    "لم يُتَح الاتّصال بخادم إشراق، فيعمل التطبيق من النسخة المحفوظة على جهازك. " +
+                        "لا شيء مفقود، وسيُلتقط أيّ تحديث عند أوّل اتّصال ناجح."
+                running ->
+                    "The Esharq server could not be reached, so the app is running from the copy " +
+                        "already on your device. Nothing is missing; a newer build will be picked " +
+                        "up on the next successful check."
+                arabic ->
+                    "لم يُتَح الاتّصال بخادم إشراق، ولا توجد نسخة محفوظة على الجهاز — " +
+                        "فديسكورد يعمل بلا إشراق حتى ينجح الاتّصال."
+                else ->
+                    "The Esharq server could not be reached and there is no saved copy on this " +
+                        "device, so Discord is running without Esharq until a check succeeds."
+            }
+
+            val detail = e.message ?: e.stackTraceToString()
+
+            AlertDialog.Builder(activity)
+                .setTitle(title)
+                .setMessage(body + "\n\n" + (if (arabic) "التفصيل: " else "Detail: ") + detail)
+                .setNegativeButton(if (arabic) "حسناً" else "Dismiss") { d, _ -> d.dismiss() }
+                .setPositiveButton(if (arabic) "أعد المحاولة" else "Retry") { d, _ ->
                     downloadScript(userInitiated = true)
-                    Toast.makeText(activity, "Retrying download in background...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        activity,
+                        if (arabic) "تُعاد المحاولة في الخلفية…" else "Retrying in the background…",
+                        Toast.LENGTH_SHORT
+                    ).show()
                     d.dismiss()
                 }
-                .setNeutralButton("Recovery") { d, _ -> showRecoveryAlert(activity); d.dismiss() }
+                .setNeutralButton(if (arabic) "الاستعادة" else "Recovery") { d, _ ->
+                    showRecoveryAlert(activity); d.dismiss()
+                }
                 .show()
         }
     }
