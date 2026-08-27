@@ -32,8 +32,24 @@ data class LoaderConfig(
  * The actual loading of the bundle is handled by [revengeScriptLoader].
  */
 object RevengeUpdater {
-    internal val TIMEOUT = 10.seconds
-    private val TIMEOUT_CACHED = 5.seconds
+    /**
+     * How long a download may take.
+     *
+     * These were 10 and 5 seconds, chosen when the bundle was small enough that it never mattered.
+     * It is now megabytes of Arabic dictionary, and the arithmetic turned against them quietly:
+     * five seconds meant demanding 588 KB/s sustained from a phone on mobile data before an update
+     * would be accepted at all. Below that bar the download is abandoned every single time, so the
+     * user stays on the build they have — for good, with nothing saying why.
+     *
+     * The cold budget is the one that decides whether somebody installing today gets Esharq at all,
+     * so it is the more generous of the two. The cached budget can afford to be shorter, because
+     * failing it costs only an update, but not as short as it was.
+     *
+     * Note that TIMEOUT is also what RevengeScriptLoader blocks the launch on, so raising it is not
+     * free: it is the longest the app can sit waiting before starting without the mod.
+     */
+    internal val TIMEOUT = 20.seconds
+    private val TIMEOUT_CACHED = 15.seconds
 
     /** How long to wait before the one silent retry. Long enough for wifi to finish associating. */
     private val RETRY_DELAY = 3.seconds
