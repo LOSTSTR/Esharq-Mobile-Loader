@@ -50,6 +50,22 @@ internal sealed class ETagFetchResult {
     class Refused(val refusal: EsharqRefusal) : ETagFetchResult()
 }
 
+/**
+ * The server answered, badly.
+ *
+ * 🔴 It carries the server's own sentence, because that sentence used to be thrown away. Only 401
+ * and 403 had their bodies read; every other status raised Ktor's generic error, so a 503 put
+ * "Bad response: HttpResponse[.../grant, 503 Service Unavailable]" in front of an Arabic-speaking
+ * user while the words explaining it sat unread in the response body.
+ *
+ * An exception rather than a `Refused`, deliberately: a refusal deletes the install, and a server
+ * that is briefly unwell must never do that.
+ */
+class EsharqServerException(
+    val status: Int,
+    val refusal: EsharqRefusal?
+) : Exception(refusal?.message?.takeIf { it.isNotBlank() } ?: "Server returned $status")
+
 internal suspend fun HttpClient.getWithETag(
     url: String,
     etag: String?,
@@ -77,6 +93,19 @@ internal suspend fun HttpClient.getWithETag(
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden ->
             ETagFetchResult.Refused(EsharqRefusal.parse(response.body()))
 
-        else -> throw ResponseException(response, "Received status: ${response.status}")
+        // 🔴 The server writes a sentence for exactly this case, in both languages, and it was
+        // never shown to anybody.
+        //
+        // Only 401 and 403 had their bodies read, so a 503 fell through to the throw below and the
+        // user was handed Ktor's own English text — "Bad response: HttpResponse[…/grant, 503 Service
+        // Unavailable]" — on an Arabic-first client. The words that explain what happened and what
+        // to do about it sat in the response, unread.
+        //
+        // Carried on the exception rather than turned into a refusal, because the two mean opposite
+        // things: a refusal deletes the install, and a server that is briefly unwell must not.
+        else -> throw EsharqServerException(
+            status = response.status.value,
+            refusal = runCatching { EsharqRefusal.parse(response.body<ByteArray>()) }.getOrNull()
+        )
     }
 }

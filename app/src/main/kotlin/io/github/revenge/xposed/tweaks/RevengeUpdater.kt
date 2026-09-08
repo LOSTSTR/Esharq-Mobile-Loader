@@ -51,11 +51,30 @@ object RevengeUpdater {
     internal val TIMEOUT = 20.seconds
     private val TIMEOUT_CACHED = 15.seconds
 
-    /** How long to wait before the one silent retry. Long enough for wifi to finish associating. */
-    private val RETRY_DELAY = 3.seconds
+    /**
+     * How long to wait before each further attempt.
+     *
+     * The first attempt runs the instant Discord starts, which is the worst moment to ask for a
+     * network: wifi may not have associated, and a phone waking from doze throttles its first
+     * sockets. Three seconds covers that.
+     *
+     * 🔴 The second pause is far longer because the failure it answers is a different one. A 503
+     * from our own server is not a phone that is not ready — it is an outage measured in tens of
+     * seconds, and asking again three seconds later only spends battery to be told the same thing.
+     */
+    private val RETRY_DELAYS = listOf(3.seconds, 15.seconds)
 
+    /**
+     * Whether this launch has already spent one unit of the offline budget.
+     *
+     * 🔴 The budget is counted in *launches* — that is the whole reason a clock cannot cheat it. But
+     * the counter used to fire once per failed attempt, and the Retry button re-enters the same
+     * path, so a few taps during one server outage plus the launch itself reached
+     * MAX_UNVERIFIED_LAUNCHES and deleted a perfectly good cached bundle. A user pressing the button
+     * the dialog offers them must not be able to destroy their own install.
+     */
     @Volatile
-    private var retried = false
+    private var countedThisLaunch = false
     private const val ETAG_PATH = "etag.txt"
     private const val CONFIG_PATH = "loader.json"
 
@@ -109,6 +128,9 @@ object RevengeUpdater {
      * against a clock the user controls, while a launch that has happened cannot be un-happened.
      */
     private fun countUnverifiedLaunch() {
+        if (countedThisLaunch) return
+        countedThisLaunch = true
+
         val count = readUnverified() + 1
         runCatching { AtomicFile(unverifiedLaunches).writeBytes(count.toString().toByteArray()) }
 
@@ -158,114 +180,153 @@ object RevengeUpdater {
      */
     fun downloadScript(userInitiated: Boolean = false, showDialog: Boolean = true): Job = scope.launch {
         try {
-            val token = install?.token
-            if (token == null) {
-                // No receipt in this APK: the module was not installed by the Esharq installer.
-                // There is nothing to fall back to, and that is the point.
-                log.w("No Esharq install token in this APK; nothing will be loaded")
-                clearAuthorisedFiles()
-                return@launch
-            }
-
-            // The grant is asked for first, and it is tiny. It is what the bundle checks before it
-            // touches Discord, so a stale one must never outlive a refusal: re-fetching it every
-            // launch is what turns "left the server" into "stops working" with no revocation list
-            // to maintain. It also means a refusal costs one small request, not a whole bundle.
-            val grant = httpClient.getWithETag(
-                url = RevengeConstants.GRANT_URL,
-                etag = null,
-                timeoutMillis = if (userInitiated) null else TIMEOUT.inWholeMilliseconds,
-                bearer = token,
-            )
-
-            // The server answered at all, which is what the streak counts.
-            clearUnverifiedLaunches()
-            retried = false
-
-            if (grant is ETagFetchResult.Refused) {
-                log.w("Refused: ${grant.refusal.reason}")
-                clearAuthorisedFiles(grant.refusal)
-                showRefusalDialog(grant.refusal)
-                return@launch
-            }
-
-            if (grant is ETagFetchResult.Fetched) {
-                AtomicFile(grantPreload).writeBytes(grant.bytes)
-                grant.renewedToken?.let { AtomicFile(renewedToken).writeBytes(it.toByteArray()) }
-            }
-
-            // The custom URL stays for development only. In a release build it would be a way to
-            // point a member's authorised loader at an unauthorised bundle.
-            val url = config.customLoadUrl.takeIf { it.enabled && BuildConfig.DEBUG }?.url
-                ?: RevengeConstants.BUNDLE_URL
-            log.i("Fetching JS bundle from: $url")
-
-            val result = httpClient.getWithETag(
-                url = url,
-                etag = if (etag.exists() && bundle.exists()) etag.readText() else null,
-                timeoutMillis = if (userInitiated) null
-                else if (bundle.exists()) TIMEOUT_CACHED.inWholeMilliseconds else TIMEOUT.inWholeMilliseconds,
-                bearer = token,
-            )
-
-            when (result) {
-                is ETagFetchResult.Fetched -> {
-                    AtomicFile(bundle).writeBytes(result.bytes)
-
-                    result.etag?.let(etag::writeText) ?: etag.delete()
-
-                    log.i("Bundle updated (${result.bytes.size} bytes)")
-                    if (showDialog) {
-                        if (userInitiated) showSuccessDialog() else showUpdateDialog()
-                    }
-                }
-
-                ETagFetchResult.NotModified -> log.i("Server responded with 304, no changes")
-
-                is ETagFetchResult.Refused -> {
-                    log.w("Refused: ${result.refusal.reason}")
-                    clearAuthorisedFiles(result.refusal)
-                    showRefusalDialog(result.refusal)
-                }
-            }
-        } catch (e: Throwable) {
-            // A network failure is not a refusal, so a bad connection does not cost the user their
-            // client — but it is counted, and enough of them in a row drop the cache anyway.
-            // Otherwise leaving the server and switching the network off would keep Esharq running
-            // for good, and the grant's expiry could not stop it: that is checked against a clock
-            // the same person sets.
-            log.e("Failed to download script", e)
-
-            // One quiet retry before anybody is told anything.
+            // 🔴 A loop, not a recursive call, and the difference is not stylistic.
             //
-            // The first attempt runs the instant Discord starts, which is the worst moment to ask
-            // for a network: wifi may not have associated yet, and a phone waking from doze
-            // throttles the first sockets it opens. A single failure at that moment is normal and
-            // says nothing about whether anything is wrong, yet it used to put a failure dialog in
-            // front of the user on a launch where everything then worked. Waiting a moment and
-            // asking once more turns most of those into nothing at all.
-            if (!retried) {
-                retried = true
-                delay(RETRY_DELAY)
-                log.i("Retrying after ${RETRY_DELAY.inWholeSeconds}s")
-                downloadScript(userInitiated = userInitiated, showDialog = showDialog)
-                return@launch
-            }
+            // Retrying used to mean launching `downloadScript` again as a separate coroutine and
+            // returning from this one. Two things followed, both bad:
+            //
+            //   * The `finally` completed `downloadReady` the moment the first attempt gave up, so
+            //     the launch stopped waiting and Discord started without Esharq even when the retry
+            //     was about to succeed a second later — and the success dialog was suppressed too,
+            //     so the user sat in plain Discord with a working bundle on disk and no hint that
+            //     reopening would fix it.
+            //
+            //   * The fresh call cleared the retry flag as soon as the *grant* succeeded, before the
+            //     bundle was fetched. A bundle-only failure — the tiny grant works, the three
+            //     megabytes time out — therefore retried without end, every few seconds, for the
+            //     life of the process, and never once reached the counter or the error dialog.
+            //     Nothing was shown and nothing stopped.
+            //
+            // Kept in one coroutine the budget is a local number nothing can reset, and the launch
+            // waits for the real outcome.
+            var attempt = 0
 
-            countUnverifiedLaunch()
-            showErrorDialog(e)
+            while (true) {
+                try {
+                    attemptDownload(userInitiated, showDialog)
+                    return@launch
+                } catch (e: Throwable) {
+                    log.e("Failed to download script (attempt ${attempt + 1})", e)
+
+                    if (attempt >= RETRY_DELAYS.size) {
+                        // A network failure is not a refusal, so a bad connection does not cost the
+                        // user their client — but it is counted, and enough of them in a row drop
+                        // the cache anyway. Otherwise leaving the server and switching the network
+                        // off would keep Esharq running for good, and the grant's expiry could not
+                        // stop it: that is checked against a clock the same person sets.
+                        countUnverifiedLaunch()
+                        showErrorDialog(e)
+                        return@launch
+                    }
+
+                    val pause = RETRY_DELAYS[attempt]
+                    log.i("Retrying in ${pause.inWholeSeconds}s")
+                    delay(pause)
+                    attempt++
+                }
+            }
         } finally {
             _downloadReady.complete(Unit)
         }
     }
 
+    /**
+     * One whole attempt: the grant, then the bundle.
+     *
+     * Throws on anything the caller should consider retrying, and returns normally when the outcome
+     * is settled — including a refusal, which is an answer and must never be tried again.
+     */
+    private suspend fun attemptDownload(userInitiated: Boolean, showDialog: Boolean) {
+
+        val token = install?.token
+        if (token == null) {
+            // No receipt in this APK: the module was not installed by the Esharq installer.
+            // There is nothing to fall back to, and that is the point.
+            log.w("No Esharq install token in this APK; nothing will be loaded")
+            clearAuthorisedFiles()
+            return
+        }
+
+        // The grant is asked for first, and it is tiny. It is what the bundle checks before it
+        // touches Discord, so a stale one must never outlive a refusal: re-fetching it every
+        // launch is what turns "left the server" into "stops working" with no revocation list
+        // to maintain. It also means a refusal costs one small request, not a whole bundle.
+        val grant = httpClient.getWithETag(
+            url = RevengeConstants.GRANT_URL,
+            etag = null,
+            timeoutMillis = if (userInitiated) null else TIMEOUT.inWholeMilliseconds,
+            bearer = token,
+        )
+
+        // The server answered at all, which is what the streak counts.
+        clearUnverifiedLaunches()
+
+        if (grant is ETagFetchResult.Refused) {
+            log.w("Refused: ${grant.refusal.reason}")
+            clearAuthorisedFiles(grant.refusal)
+            showRefusalDialog(grant.refusal)
+            return
+        }
+
+        if (grant is ETagFetchResult.Fetched) {
+            AtomicFile(grantPreload).writeBytes(grant.bytes)
+            grant.renewedToken?.let { AtomicFile(renewedToken).writeBytes(it.toByteArray()) }
+        }
+
+        // The custom URL stays for development only. In a release build it would be a way to
+        // point a member's authorised loader at an unauthorised bundle.
+        val url = config.customLoadUrl.takeIf { it.enabled && BuildConfig.DEBUG }?.url
+            ?: RevengeConstants.BUNDLE_URL
+        log.i("Fetching JS bundle from: $url")
+
+        val result = httpClient.getWithETag(
+            url = url,
+            etag = if (etag.exists() && bundle.exists()) etag.readText() else null,
+            timeoutMillis = if (userInitiated) null
+            else if (bundle.exists()) TIMEOUT_CACHED.inWholeMilliseconds else TIMEOUT.inWholeMilliseconds,
+            bearer = token,
+        )
+
+        when (result) {
+            is ETagFetchResult.Fetched -> {
+                AtomicFile(bundle).writeBytes(result.bytes)
+
+                result.etag?.let(etag::writeText) ?: etag.delete()
+
+                log.i("Bundle updated (${result.bytes.size} bytes)")
+                if (showDialog) {
+                    if (userInitiated) showSuccessDialog() else showUpdateDialog()
+                }
+            }
+
+            ETagFetchResult.NotModified -> log.i("Server responded with 304, no changes")
+
+            is ETagFetchResult.Refused -> {
+                log.w("Refused: ${result.refusal.reason}")
+                clearAuthorisedFiles(result.refusal)
+                showRefusalDialog(result.refusal)
+            }
+        }
+    }
+
+    /** The device's language, asked once per dialog rather than written out at each call site. */
+    private fun isArabic(): Boolean = java.util.Locale.getDefault().language == "ar"
+
     private fun showUpdateDialog() = withAppActivity { activity ->
         activity.runOnUiThread {
             AlertDialog.Builder(activity)
-                .setTitle("Revenge Update Downloaded")
-                .setMessage("A reload is required for changes to take effect.")
-                .setPositiveButton("Reload") { d, _ -> reloadApp(); d.dismiss() }
-                .setNegativeButton("Later") { d, _ -> d.dismiss() }
+                // 🔴 Said in the user's language, like everything else.
+                //
+                // These two were left in English — and still called the project "Revenge" — while
+                // the dialog beside them was translated. The success one is what a user sees right
+                // after tapping Retry, so it sits on the very path they just walked.
+                .setTitle(if (isArabic()) "نُزّل تحديث إشراق" else "Esharq update downloaded")
+                .setMessage(
+                    if (isArabic()) "أعد تشغيل ديسكورد ليأخذ التحديث مفعوله."
+                    else "Reload Discord for the update to take effect."
+                )
+                .setPositiveButton(if (isArabic()) "إعادة التشغيل" else "Reload") { d, _ -> reloadApp(); d.dismiss() }
+                .setNegativeButton(if (isArabic()) "لاحقاً" else "Later") { d, _ -> d.dismiss() }
                 .show()
         }
     }
@@ -273,10 +334,13 @@ object RevengeUpdater {
     private fun showSuccessDialog() = withAppActivity { activity ->
         activity.runOnUiThread {
             AlertDialog.Builder(activity)
-                .setTitle("Revenge Update Successful")
-                .setMessage("A reload is required for changes to take effect.")
-                .setPositiveButton("Reload") { d, _ -> reloadApp(); d.dismiss() }
-                .setNegativeButton("Later") { d, _ -> d.dismiss() }
+                .setTitle(if (isArabic()) "تمّ التحديث" else "Esharq updated")
+                .setMessage(
+                    if (isArabic()) "أعد تشغيل ديسكورد ليأخذ التحديث مفعوله."
+                    else "Reload Discord for the update to take effect."
+                )
+                .setPositiveButton(if (isArabic()) "إعادة التشغيل" else "Reload") { d, _ -> reloadApp(); d.dismiss() }
+                .setNegativeButton(if (isArabic()) "لاحقاً" else "Later") { d, _ -> d.dismiss() }
                 .show()
         }
     }
@@ -351,7 +415,13 @@ object RevengeUpdater {
                         "device, so Discord is running without Esharq until a check succeeds."
             }
 
-            val detail = e.message ?: e.stackTraceToString()
+            // 🔴 The server's own sentence, when it sent one.
+            //
+            // A 503 used to surface as Ktor's English "Bad response: HttpResponse[…]" even though
+            // the server had written the explanation in Arabic and English and sent it in the body.
+            // That text is now carried on the exception, so what the user reads is what we wrote.
+            val fromServer = (e as? EsharqServerException)?.refusal?.message?.takeIf { it.isNotBlank() }
+            val detail = fromServer ?: e.message ?: e.stackTraceToString()
 
             AlertDialog.Builder(activity)
                 .setTitle(title)
