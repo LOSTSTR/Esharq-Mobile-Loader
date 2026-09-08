@@ -6,6 +6,7 @@ import io.ktor.client.engine.cio.*
 import io.ktor.client.plugins.*
 import io.ktor.client.plugins.compression.*
 import io.ktor.client.request.*
+import io.ktor.client.statement.*
 import io.ktor.http.*
 
 internal val httpClient by lazy {
@@ -48,7 +49,28 @@ internal sealed class ETagFetchResult {
      * failed". A failed network keeps the cached bundle; this deletes it.
      */
     class Refused(val refusal: EsharqRefusal) : ETagFetchResult()
+
+    /**
+     * The server pointed somewhere else instead of sending the file.
+     *
+     * 🔴 The bundle is three megabytes, and routing it through the server meant every download of it
+     * left that server's own network — which is metered, and which pauses the whole site when the
+     * allowance runs out. No grant, no bundle, no working client for anybody, over a file that was
+     * already sitting on a host built to serve exactly this.
+     *
+     * So the server hands over a short-lived signed link and we fetch it ourselves. The link is only
+     * ever issued after membership has been checked, and it carries no credential of ours.
+     */
+    class Located(val url: String, val etag: String?) : ETagFetchResult()
 }
+
+/** What the server answers with when it hands over a link rather than the file. */
+@kotlinx.serialization.Serializable
+internal data class BundleLocation(
+    val ok: Boolean = false,
+    val url: String = "",
+    val etag: String? = null
+)
 
 /**
  * The server answered, badly.
@@ -66,8 +88,52 @@ class EsharqServerException(
     val refusal: EsharqRefusal?
 ) : Exception(refusal?.message?.takeIf { it.isNotBlank() } ?: "Server returned $status")
 
+/**
+ * A 200, which is now two different things.
+ *
+ * The server sends the file to a client that did not ask for a link, and a small JSON object naming
+ * where the file is to a client that did. Told apart by the content type rather than by what we
+ * asked for, so a server that has not been updated yet still answers usefully.
+ */
+private suspend fun parseOk(response: HttpResponse, preferLocation: Boolean): ETagFetchResult {
+    val renewedToken = response.headers["X-Esharq-Token"]?.takeIf { it.isNotEmpty() }
+    val etag = response.headers[HttpHeaders.ETag]?.takeIf { it.isNotEmpty() }
+    val isJson = response.contentType()?.match(ContentType.Application.Json) == true
+
+    if (preferLocation && isJson) {
+        val located = runCatching { RevengeJson.decodeFromString<BundleLocation>(response.body()) }.getOrNull()
+        if (located != null && located.ok && located.url.isNotBlank()) {
+            return ETagFetchResult.Located(located.url, located.etag ?: etag)
+        }
+    }
+
+    return ETagFetchResult.Fetched(
+        bytes = response.body(),
+        etag = etag,
+        // The receipt baked into the APK expires, and an APK cannot rewrite itself. The server hands
+        // back a fresh one on every authorised call, so an install that keeps checking in never has
+        // to be run through the installer again — one that goes quiet does.
+        renewedToken = renewedToken,
+    )
+}
+
+/**
+ * Fetch a file from a link the server handed us, carrying nothing of ours.
+ *
+ * 🔴 No bearer, deliberately. The link points at another host, and Ktor forwards headers across a
+ * redirect — sending our receipt there would hand a credential to a party with no business holding
+ * one. It is not needed either: the link is itself the permission, and it was only issued after
+ * membership had been checked.
+ */
+internal suspend fun HttpClient.downloadFrom(url: String, timeoutMillis: Long): ByteArray =
+    get(url) {
+        timeout { requestTimeoutMillis = timeoutMillis }
+    }.body()
+
 internal suspend fun HttpClient.getWithETag(
     url: String,
+    /** Ask the server for a link to the file rather than the file itself. */
+    preferLocation: Boolean = false,
     etag: String?,
     timeoutMillis: Long? = null,
     bearer: String? = null,
@@ -75,19 +141,12 @@ internal suspend fun HttpClient.getWithETag(
     val response = get(url) {
         etag?.let { headers.append(HttpHeaders.IfNoneMatch, it) }
         bearer?.let { headers.append(HttpHeaders.Authorization, "Bearer $it") }
+        if (preferLocation) headers.append("X-Esharq-Location", "1")
         timeoutMillis?.let { timeout { requestTimeoutMillis = it } }
     }
 
     return when (response.status) {
-        HttpStatusCode.OK -> ETagFetchResult.Fetched(
-            bytes = response.body(),
-            etag = response.headers[HttpHeaders.ETag]?.takeIf { it.isNotEmpty() },
-            // The receipt baked into the APK expires, and an APK cannot rewrite itself. The server
-            // hands back a fresh one on every authorised call, so an install that keeps checking in
-            // never has to be run through the installer again — one that goes quiet does.
-            renewedToken = response.headers["X-Esharq-Token"]?.takeIf { it.isNotEmpty() },
-        )
-
+        HttpStatusCode.OK -> parseOk(response, preferLocation)
         HttpStatusCode.NotModified -> ETagFetchResult.NotModified
 
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden ->

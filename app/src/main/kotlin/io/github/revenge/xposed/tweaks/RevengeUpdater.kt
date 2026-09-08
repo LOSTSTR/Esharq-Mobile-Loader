@@ -52,6 +52,16 @@ object RevengeUpdater {
     private val TIMEOUT_CACHED = 15.seconds
 
     /**
+     * The budget when the user asked for it themselves, by tapping Retry.
+     *
+     * 🔴 That path used to pass `null` and a comment said the timeout was disabled — but the client
+     * installs `HttpTimeout` with no defaults, so Ktor's own request timeout applied instead. The
+     * attempt a user waits for on purpose therefore had the *shortest* budget of the three, which is
+     * the opposite of what was intended and what the comment claimed.
+     */
+    private val USER_DOWNLOAD_TIMEOUT = 90.seconds
+
+    /**
      * How long to wait before each further attempt.
      *
      * The first attempt runs the instant Discord starts, which is the worst moment to ask for a
@@ -281,6 +291,10 @@ object RevengeUpdater {
 
         val result = httpClient.getWithETag(
             url = url,
+            // Ask for a link rather than the file. Three megabytes through the server is metered
+            // traffic that pauses the whole site when it runs out, over a file already sitting on a
+            // host built to serve it.
+            preferLocation = true,
             etag = if (etag.exists() && bundle.exists()) etag.readText() else null,
             timeoutMillis = if (userInitiated) null
             else if (bundle.exists()) TIMEOUT_CACHED.inWholeMilliseconds else TIMEOUT.inWholeMilliseconds,
@@ -294,6 +308,35 @@ object RevengeUpdater {
                 result.etag?.let(etag::writeText) ?: etag.delete()
 
                 log.i("Bundle updated (${result.bytes.size} bytes)")
+                if (showDialog) {
+                    if (userInitiated) showSuccessDialog() else showUpdateDialog()
+                }
+            }
+
+            is ETagFetchResult.Located -> {
+                // Fetched without our bearer, deliberately.
+                //
+                // 🔴 The link points at somebody else's host, and Ktor forwards headers across a
+                // redirect. Sending our receipt there would hand a credential to a party that has no
+                // business holding one — so this request carries nothing of ours at all. It does not
+                // need to: the link is itself the permission, and the server only issued it after
+                // checking membership.
+                log.i("Fetching bundle from the location the server gave")
+
+                val budget = when {
+                    userInitiated -> USER_DOWNLOAD_TIMEOUT
+                    bundle.exists() -> TIMEOUT_CACHED
+                    else -> TIMEOUT
+                }
+
+                val bytes = httpClient.downloadFrom(result.url, budget.inWholeMilliseconds)
+
+                if (bytes.isEmpty()) error("The bundle arrived empty")
+
+                AtomicFile(bundle).writeBytes(bytes)
+                result.etag?.let(etag::writeText) ?: etag.delete()
+
+                log.i("Bundle updated (${bytes.size} bytes)")
                 if (showDialog) {
                     if (userInitiated) showSuccessDialog() else showUpdateDialog()
                 }

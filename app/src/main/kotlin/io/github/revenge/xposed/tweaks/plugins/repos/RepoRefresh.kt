@@ -52,5 +52,10 @@ internal suspend fun refreshRepo(url: String): RepoIndex {
         // failure of that repository alone.
         is ETagFetchResult.Refused ->
             throw IllegalStateException("Repository '$url' refused the request: ${result.refusal.reason}")
+
+        // Only the bundle asks to be pointed elsewhere, and only Esharq's own server answers that
+        // way. A repository doing it would be answering a question this fetch never asked.
+        is ETagFetchResult.Located ->
+            throw IllegalStateException("Repository '$url' answered with a redirect it was not asked for")
     }
 }
