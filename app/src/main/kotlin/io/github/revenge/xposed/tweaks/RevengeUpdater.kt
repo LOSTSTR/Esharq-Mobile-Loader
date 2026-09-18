@@ -12,6 +12,8 @@ import io.github.revenge.xposed.tweaks.plugins.internal.showRecoveryAlert
 import kotlinx.coroutines.*
 import kotlinx.serialization.Serializable
 import java.io.File
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.seconds
 
 @Serializable
@@ -75,6 +77,30 @@ object RevengeUpdater {
     private val RETRY_DELAYS = listOf(3.seconds, 15.seconds)
 
     /**
+     * How long a download straight from GitHub may take before this attempt gives up on it and asks
+     * our server for the file instead.
+     *
+     * 🔴 Well under the launch budget, because the fallback has to fit in what is left. GitHub sends
+     * the bundle uncompressed — 3 MB, measured — while our server sends it gzipped at about a sixth
+     * of that, so on a slow line the direct route is the slow one by a wide margin. Ten seconds
+     * covers any connection that can carry 3 MB comfortably; below that the member is better served
+     * by the smaller copy, and the launch is still waiting when it arrives.
+     */
+    private val DIRECT_BUDGET = 10.seconds
+    private val USER_DIRECT_BUDGET = 30.seconds
+
+    /**
+     * How long a failed direct download keeps this phone on our server.
+     *
+     * A network that cannot reach GitHub's CDN today will not reach it on the next launch either, and
+     * trying again first costs the connect timeout on every single launch. A week is long enough to
+     * spare that, short enough that a phone which has moved to a better network goes back to the
+     * route that costs the site nothing. A clock set backwards only ends the week early.
+     */
+    private val DIRECT_SKIP = 7.days
+    private const val DIRECT_FAILED_PATH = "direct-failed.txt"
+
+    /**
      * Whether this launch has already spent one unit of the offline budget.
      *
      * 🔴 The budget is counted in *launches* — that is the whole reason a clock cannot cheat it. But
@@ -104,6 +130,7 @@ object RevengeUpdater {
     private lateinit var grantPreload: File
     private lateinit var renewedToken: File
     private lateinit var unverifiedLaunches: File
+    private lateinit var directFailed: File
 
     private val _downloadReady = CompletableDeferred<Unit>()
 
@@ -124,8 +151,36 @@ object RevengeUpdater {
         grantPreload = File(preloadsDir, RevengeConstants.GRANT_PRELOAD_FILE)
         renewedToken = File(filesDir, RevengeConstants.RENEWED_TOKEN_FILE)
         unverifiedLaunches = File(filesDir, RevengeConstants.UNVERIFIED_LAUNCHES_FILE)
+        directFailed = File(cacheDir, DIRECT_FAILED_PATH)
 
         install = readEsharqInstall(appInfo, renewedToken)
+    }
+
+    /**
+     * A link already failed in this launch, so the retries go straight to our server.
+     *
+     * In memory only. Whether it becomes the week-long skip is decided by what our server did next —
+     * see [rememberDirectFailure].
+     */
+    @Volatile
+    private var directFailedThisLaunch = false
+
+    /** Whether this phone is inside the week after GitHub failed it while our server did not. */
+    private fun directSkipped(): Boolean {
+        val failedAt = runCatching { directFailed.readText().trim().toLong() }.getOrNull() ?: return false
+        val age = System.currentTimeMillis() - failedAt
+        return age >= 0 && age < DIRECT_SKIP.inWholeMilliseconds
+    }
+
+    /**
+     * Keeps this phone on our server for a week — called only once our server has answered.
+     *
+     * 🔴 Not the moment the link fails. A network that drops at launch, or a CDN outage, fails the link
+     * *and* our server alike; saving the skip then would put a phone whose route to GitHub is fine on
+     * metered streaming for a week. Our server answering while GitHub did not is the evidence.
+     */
+    private fun rememberDirectFailure() {
+        runCatching { AtomicFile(directFailed).writeBytes(System.currentTimeMillis().toString().toByteArray()) }
     }
 
     private fun readUnverified(): Int =
@@ -213,7 +268,14 @@ object RevengeUpdater {
 
             while (true) {
                 try {
-                    attemptDownload(userInitiated, showDialog)
+                    // Bounded as a whole, not only request by request. Every request inside has its
+                    // own timeout, but none of them covers the engine's name lookup, which blocks
+                    // where cancellation cannot reach (see withHardDeadline). This loop is what turns
+                    // a failure into a retry and three failures into a dialog, so it must get control
+                    // back whatever the network is doing.
+                    withHardDeadline(attemptDeadline(userInitiated).inWholeMilliseconds) {
+                        attemptDownload(userInitiated, showDialog)
+                    }
                     return@launch
                 } catch (e: Throwable) {
                     log.e("Failed to download script (attempt ${attempt + 1})", e)
@@ -239,6 +301,11 @@ object RevengeUpdater {
             _downloadReady.complete(Unit)
         }
     }
+
+    /** The longest one attempt can legitimately take: every budget inside it spent in full, plus slack. */
+    private fun attemptDeadline(userInitiated: Boolean): Duration =
+        if (userInitiated) 15.seconds + USER_DOWNLOAD_TIMEOUT * 2 + USER_DIRECT_BUDGET + 10.seconds
+        else TIMEOUT * 3 + DIRECT_BUDGET + 10.seconds
 
     /**
      * One whole attempt: the grant, then the bundle.
@@ -289,58 +356,89 @@ object RevengeUpdater {
             ?: RevengeConstants.BUNDLE_URL
         log.i("Fetching JS bundle from: $url")
 
+        val heldEtag = if (etag.exists() && bundle.exists()) etag.readText() else null
+        val serverBudget = when {
+            // The user is waiting on purpose; see USER_DOWNLOAD_TIMEOUT for why this is not null.
+            userInitiated -> USER_DOWNLOAD_TIMEOUT
+            bundle.exists() -> TIMEOUT_CACHED
+            else -> TIMEOUT
+        }.inWholeMilliseconds
+
+        // Ask for a link rather than the file — three megabytes through the server is metered traffic
+        // that pauses the whole site when it runs out — but only when a failed link cannot cost
+        // anything:
+        //
+        //  * Not with no copy on the phone. That launch has nothing to run while a fallback finishes,
+        //    and GitHub sends the file uncompressed, about six times what our server sends. The server
+        //    answers such a request with the file anyway; asking for none keeps this loader safe
+        //    against a server that does not (as the one live when this was written did not).
+        //  * Not once a link has failed this phone, for the rest of this launch or the week after.
+        val skipped = directSkipped()
+        val preferLocation = heldEtag != null && !directFailedThisLaunch && !skipped
+
         val result = httpClient.getWithETag(
             url = url,
-            // Ask for a link rather than the file. Three megabytes through the server is metered
-            // traffic that pauses the whole site when it runs out, over a file already sitting on a
-            // host built to serve it.
-            preferLocation = true,
-            etag = if (etag.exists() && bundle.exists()) etag.readText() else null,
-            timeoutMillis = if (userInitiated) null
-            else if (bundle.exists()) TIMEOUT_CACHED.inWholeMilliseconds else TIMEOUT.inWholeMilliseconds,
+            preferLocation = preferLocation,
+            etag = heldEtag,
+            timeoutMillis = serverBudget,
             bearer = token,
+            direct = when {
+                heldEtag == null -> null
+                directFailedThisLaunch -> "failed"
+                skipped -> "skipped"
+                else -> null
+            },
         )
 
+        if (result !is ETagFetchResult.Located) {
+            settle(result, userInitiated, showDialog)
+            return
+        }
+
+        // Fetched without our bearer, deliberately.
+        //
+        // 🔴 The link points at somebody else's host, and Ktor forwards headers across a redirect.
+        // Sending our receipt there would hand a credential to a party that has no business holding
+        // one — so this request carries nothing of ours at all. It does not need to: the link is
+        // itself the permission, and the server only issued it after checking membership.
+        log.i("Fetching bundle from the location the server gave")
+
+        val outcome = followLink(
+            link = result,
+            budgetMillis = (if (userInitiated) USER_DIRECT_BUDGET else DIRECT_BUDGET).inWholeMilliseconds,
+            download = { link, budget -> httpClient.downloadFrom(link, budget) },
+            fallback = { failure ->
+                log.w("Direct download failed (${failure.message}); fetching the bundle from our server instead")
+                directFailedThisLaunch = true
+                httpClient.getWithETag(
+                    url = url,
+                    preferLocation = false,
+                    etag = heldEtag,
+                    timeoutMillis = serverBudget,
+                    bearer = token,
+                    direct = "failed",
+                )
+            },
+        )
+
+        when (outcome) {
+            is LinkOutcome.Direct -> writeBundle(outcome.bytes, outcome.etag, userInitiated, showDialog)
+
+            is LinkOutcome.FellBack -> {
+                settle(outcome.answer, userInitiated, showDialog)
+                // Reached only if that answer was acted on without throwing: our server delivered
+                // (or confirmed) the bundle GitHub would not.
+                if (outcome.answer is ETagFetchResult.Fetched || outcome.answer is ETagFetchResult.NotModified) {
+                    rememberDirectFailure()
+                }
+            }
+        }
+    }
+
+    /** Acts on an answer that is not a link. */
+    private fun settle(result: ETagFetchResult, userInitiated: Boolean, showDialog: Boolean) {
         when (result) {
-            is ETagFetchResult.Fetched -> {
-                AtomicFile(bundle).writeBytes(result.bytes)
-
-                result.etag?.let(etag::writeText) ?: etag.delete()
-
-                log.i("Bundle updated (${result.bytes.size} bytes)")
-                if (showDialog) {
-                    if (userInitiated) showSuccessDialog() else showUpdateDialog()
-                }
-            }
-
-            is ETagFetchResult.Located -> {
-                // Fetched without our bearer, deliberately.
-                //
-                // 🔴 The link points at somebody else's host, and Ktor forwards headers across a
-                // redirect. Sending our receipt there would hand a credential to a party that has no
-                // business holding one — so this request carries nothing of ours at all. It does not
-                // need to: the link is itself the permission, and the server only issued it after
-                // checking membership.
-                log.i("Fetching bundle from the location the server gave")
-
-                val budget = when {
-                    userInitiated -> USER_DOWNLOAD_TIMEOUT
-                    bundle.exists() -> TIMEOUT_CACHED
-                    else -> TIMEOUT
-                }
-
-                val bytes = httpClient.downloadFrom(result.url, budget.inWholeMilliseconds)
-
-                if (bytes.isEmpty()) error("The bundle arrived empty")
-
-                AtomicFile(bundle).writeBytes(bytes)
-                result.etag?.let(etag::writeText) ?: etag.delete()
-
-                log.i("Bundle updated (${bytes.size} bytes)")
-                if (showDialog) {
-                    if (userInitiated) showSuccessDialog() else showUpdateDialog()
-                }
-            }
+            is ETagFetchResult.Fetched -> writeBundle(result.bytes, result.etag, userInitiated, showDialog)
 
             ETagFetchResult.NotModified -> log.i("Server responded with 304, no changes")
 
@@ -349,6 +447,29 @@ object RevengeUpdater {
                 clearAuthorisedFiles(result.refusal)
                 showRefusalDialog(result.refusal)
             }
+
+            // Only ever returned for a request that asked for a link, and those are handled above.
+            is ETagFetchResult.Located -> error("The server sent a link where the file was asked for")
+        }
+    }
+
+    /**
+     * Replaces the copy on the phone, but only with something that is actually a bundle.
+     *
+     * 🔴 The working copy is the last thing standing between a member and plain Discord, and it used
+     * to be overwritten by any 200 at all — a captive portal's login page, a proxy's error page, a
+     * JSON answer the parser did not recognise. Throwing here keeps the old copy and sends the attempt
+     * round the retry loop instead.
+     */
+    private fun writeBundle(bytes: ByteArray, newEtag: String?, userInitiated: Boolean, showDialog: Boolean) {
+        if (!looksLikeBundle(bytes)) error("The answer was not an Esharq bundle (${bytes.size} bytes)")
+
+        AtomicFile(bundle).writeBytes(bytes)
+        newEtag?.let(etag::writeText) ?: etag.delete()
+
+        log.i("Bundle updated (${bytes.size} bytes)")
+        if (showDialog) {
+            if (userInitiated) showSuccessDialog() else showUpdateDialog()
         }
     }
 
@@ -464,7 +585,9 @@ object RevengeUpdater {
             // the server had written the explanation in Arabic and English and sent it in the body.
             // That text is now carried on the exception, so what the user reads is what we wrote.
             val fromServer = (e as? EsharqServerException)?.refusal?.message?.takeIf { it.isNotBlank() }
-            val detail = fromServer ?: e.message ?: e.stackTraceToString()
+            // 🔴 Never a link. Ktor writes the whole URL into its messages, so a member's screenshot
+            // of this dialog published a signed download link in a public channel.
+            val detail = fromServer ?: withoutLinks(e.message ?: describeFailure(e))
 
             AlertDialog.Builder(activity)
                 .setTitle(title)
