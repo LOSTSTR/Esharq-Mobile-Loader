@@ -40,13 +40,35 @@ val fonts by tweak {
     RevengePayloadBuilder.contribute { put("fontPatch", 2) }
 
     // ReactFontManager hijack runs regardless of fonts.json presence  it falls back to the default Typeface chain if no custom font file is found.
-    XposedHelpers.findAndHookMethod(
+    //
+    // 🔴 Found by what it can do, not by where it used to live.
+    //
+    // React Native moved the font manager to `common.assets`, and Discord 345.9 ships the new one —
+    // while still carrying a class under the old name that no longer has this method. Hooking the old
+    // name threw NoSuchMethodError before anything below ran, so custom fonts silently stopped
+    // working for everyone on current Discord (measured in the loader's own log on the owner's
+    // phone; dexdump of 345.9 shows the method only on the new class). Upstream fixed the same break
+    // in revenge-xposed 66f57b7 by trying the new name first; checking for the method as well means
+    // a leftover class under either name cannot be picked by mistake.
+    val fontManager = listOf(
+        $$"com.facebook.react.common.assets.ReactFontManager$Companion",
         $$"com.facebook.react.views.text.ReactFontManager$Companion",
-        classLoader,
+    ).firstNotNullOfOrNull { name ->
+        XposedHelpers.findClassIfExists(name, classLoader)?.takeIf { cls ->
+            runCatching {
+                cls.getDeclaredMethod("createAssetTypeface", String::class.java, Int::class.java, AssetManager::class.java)
+            }.isSuccess
+        }
+    }
+
+    if (fontManager == null) {
+        log.w("No ReactFontManager with createAssetTypeface in this Discord build; custom fonts are unavailable")
+    } else XposedHelpers.findAndHookMethod(
+        fontManager,
         "createAssetTypeface",
         String::class.java,
         Int::class.java,
-        "android.content.res.AssetManager",
+        AssetManager::class.java,
         object : XC_MethodReplacement() {
             override fun replaceHookedMethod(param: MethodHookParam): Typeface? {
                 val fontFamilyName: String = param.args[0].toString()
@@ -147,7 +169,7 @@ private object FontsState {
                 if (split.size != 2) break
                 val (customName, refName) = split
                 val downloads = fontsDownloadsDir ?: break
-                val file = File(downloads, "$customName/$refName.$fileExt").apply { ensureFile() }
+                val file = File(downloads, "$customName/$refName$fileExt").apply { ensureFile() }
                 if (!file.exists()) continue
                 return Typeface.createFromFile(file.absolutePath)
             }
@@ -182,7 +204,7 @@ private object FontsState {
                     if (split.size != 2) break
                     val (customName, refName) = split
                     val downloads = fontsDownloadsDir ?: break
-                    val file = File(downloads, "$customName/$refName.$fileExt").apply { ensureFile() }
+                    val file = File(downloads, "$customName/$refName$fileExt").apply { ensureFile() }
                     if (!file.exists()) continue
                     val font = Font.Builder(file).build()
                     fontFamilies.add(FontFamily.Builder(font).build())

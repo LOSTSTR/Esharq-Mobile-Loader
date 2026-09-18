@@ -565,11 +565,15 @@ private fun loadPlugin(
         }
     }.launchIn(scope)
 
+    // Guarded, as upstream did in revenge-xposed 2ec376b: a JS side that is not ready (or gone)
+    // would otherwise throw out of the collector and silently end error reporting for this plugin.
     val errorSyncJob = pluginScope.errors.onEach {
-        pluginScope.callJSMethod(
-            EVENT_PLUGIN_ERRORED,
-            listOf(manifest.id, pluginScope.errorsJSPayload)
-        )
+        runCatching {
+            pluginScope.callJSMethod(
+                EVENT_PLUGIN_ERRORED,
+                listOf(manifest.id, pluginScope.errorsJSPayload)
+            )
+        }
     }.launchIn(scope)
 
     // Real plugin errors only happen here.
